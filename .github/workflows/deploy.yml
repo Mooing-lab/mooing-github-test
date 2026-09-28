@@ -1,0 +1,109 @@
+name: Deploy mooing-github-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag to deploy (e.g. v1.0.3)'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-2
+  S3_BUCKET: mooing-deploy-artifacts
+  S3_PREFIX: mooing-github-test
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 운영 리소스 오조작 방지 가드.
+      # 시크릿 이름을 TEST_* 로 분리해 org 레벨 운영 시크릿(KIOSK_*)을 상속받지 않게 하고,
+      # 값에 'test' 가 없으면 운영 LT/ASG 가 잘못 들어온 것으로 보고 AWS 호출 전에 중단한다.
+      - name: Guard - target must be test resources
+        env:
+          LT_NAME: ${{ secrets.TEST_LAUNCH_TEMPLATE }}
+          ASG_NAME: ${{ secrets.TEST_ASG_NAME }}
+        run: |
+          for pair in "TEST_LAUNCH_TEMPLATE=$LT_NAME" "TEST_ASG_NAME=$ASG_NAME"; do
+            key="${pair%%=*}"; val="${pair#*=}"
+            if [ -z "$val" ]; then
+              echo "Error: secret $key is empty"
+              exit 1
+            fi
+            case "$val" in
+              *test*) echo "OK: $key contains 'test'" ;;
+              *) echo "Error: $key does not contain 'test' - refusing to touch non-test resource"; exit 1 ;;
+            esac
+          done
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify artifact exists in S3
+        run: |
+          aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/mooing-github-test-${{ inputs.version }}.jar || {
+            echo "Error: Artifact not found in S3"
+            exit 1
+          }
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+
+      - name: Packer init
+        working-directory: packer
+        run: packer init test.pkr.hcl
+
+      - name: Build AMI with Packer
+        working-directory: packer
+        run: |
+          packer build \
+            -var "app_version=${{ inputs.version }}" \
+            -var "vpc_id=${{ secrets.VPC_ID }}" \
+            -var "subnet_id=${{ secrets.SUBNET_ID }}" \
+            -var "base_ami=${{ secrets.BASE_AMI_ID }}" \
+            -machine-readable \
+            test.pkr.hcl | tee /tmp/packer.log
+
+          AMI_ID=$(grep 'artifact,0,id' /tmp/packer.log | cut -d: -f2)
+          if [ -z "$AMI_ID" ]; then
+            echo "Error: Failed to extract AMI ID from Packer output"
+            cat /tmp/packer.log
+            exit 1
+          fi
+          echo "Created AMI: $AMI_ID"
+          echo "AMI_ID=$AMI_ID" >> $GITHUB_ENV
+
+      - name: Update Launch Template
+        run: |
+          NEW_VERSION=$(aws ec2 create-launch-template-version \
+            --launch-template-name ${{ secrets.TEST_LAUNCH_TEMPLATE }} \
+            --source-version '$Latest' \
+            --launch-template-data "{\"ImageId\":\"${{ env.AMI_ID }}\"}" \
+            --query 'LaunchTemplateVersion.VersionNumber' \
+            --output text)
+
+          aws ec2 modify-launch-template \
+            --launch-template-name ${{ secrets.TEST_LAUNCH_TEMPLATE }} \
+            --default-version $NEW_VERSION
+
+          echo "Launch template updated to version $NEW_VERSION with AMI ${{ env.AMI_ID }}"
+
+      - name: Start ASG Instance Refresh
+        run: |
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name ${{ secrets.TEST_ASG_NAME }} \
+            --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 120}'
+
+          echo "ASG instance refresh started for mooing-github-test"
