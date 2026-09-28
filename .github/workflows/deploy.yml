@@ -20,6 +20,9 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # AWS OIDC trust policy 의 sub 가 environment 형식이라 필수
+    # (repo:Mooing-lab/mooing-github-test:environment:production-mooing-test)
+    environment: production-mooing-test
 
     steps:
       - name: Checkout
