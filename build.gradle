@@ -8,7 +8,7 @@ plugins {
 }
 
 group = 'com.jgfactory'
-version = '1.0.1'
+version = '1.0.2'
 description = 'mooing-github-test'
 
 java {
